@@ -1,0 +1,375 @@
+from flask import Flask, request, jsonify, render_template
+from flask_sqlalchemy import SQLAlchemy
+import jwt
+import datetime
+from werkzeug.security import generate_password_hash, check_password_hash
+import requests
+import os
+from functools import wraps
+from typing import List, Dict
+
+# 初始化Flask应用
+app = Flask(__name__)
+app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'your-secure-secret-key-keep-safe-123')
+app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///academic_papers.db'
+app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+
+# 初始化数据库
+db = SQLAlchemy(app)
+
+# User模型（含管理员字段）
+class User(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    username = db.Column(db.String(80), unique=True, nullable=False)
+    password_hash = db.Column(db.String(120), nullable=False)
+    api_key = db.Column(db.String(200))  # 存储用户专属APIKey（后端录入）
+    research_fields = db.Column(db.Text)
+    created_at = db.Column(db.DateTime, default=datetime.datetime.utcnow)
+    is_admin = db.Column(db.Boolean, default=False)  # 管理员标识
+    
+    # 密码处理方法
+    def set_password(self, password):
+        self.password_hash = generate_password_hash(password)
+        
+    def check_password(self, password):
+        return check_password_hash(self.password_hash, password)
+    
+    # 研究领域处理
+    def get_research_fields(self) -> List[str]:
+        if not self.research_fields:
+            return []
+        return [field.strip() for field in self.research_fields.split(',')]
+    
+    def set_research_fields(self, fields: List[str]):
+        self.research_fields = ','.join(fields)
+
+# Paper模型
+class Paper(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    title = db.Column(db.String(200), nullable=False)
+    author = db.Column(db.String(200))
+    abstract = db.Column(db.Text)
+    keyword = db.Column(db.String(100))
+    source = db.Column(db.String(100))
+    external_id = db.Column(db.String(100))
+    created_at = db.Column(db.DateTime, default=datetime.datetime.utcnow)
+
+# PaperSummary模型
+class PaperSummary(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
+    paper_id = db.Column(db.Integer, db.ForeignKey('paper.id'), nullable=False)
+    summary_content = db.Column(db.Text, nullable=False)
+    created_at = db.Column(db.DateTime, default=datetime.datetime.utcnow)
+    
+    user = db.relationship('User', backref=db.backref('summaries', lazy=True))
+    paper = db.relationship('Paper', backref=db.backref('summaries', lazy=True))
+
+# JWT认证装饰器
+def token_required(f):
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        token = None
+        if 'Authorization' in request.headers:
+            auth_header = request.headers['Authorization']
+            token = auth_header.split(" ")[1] if len(auth_header.split(" ")) > 1 else None
+        
+        if not token:
+            return jsonify({'message': 'Token is missing!'}), 401
+        
+        try:
+            data = jwt.decode(token, app.config['SECRET_KEY'], algorithms=["HS256"])
+            current_user = User.query.filter_by(id=data['user_id']).first()
+        except jwt.ExpiredSignatureError:
+            return jsonify({'message': 'Token has expired!'}), 401
+        except jwt.InvalidTokenError:
+            return jsonify({'message': 'Token is invalid!'}), 401
+        
+        return f(current_user, *args, **kwargs)
+    
+    return decorated
+
+# 管理员权限装饰器
+def admin_required(f):
+    @wraps(f)
+    @token_required
+    def decorated(current_user, *args, **kwargs):
+        if not current_user.is_admin:
+            return jsonify({'message': '无管理员权限，无法操作APIKey！'}), 403
+        return f(current_user, *args, **kwargs)
+    
+    return decorated
+
+# 注册接口（管理员专用）
+@app.route('/api/register', methods=['POST'])
+@token_required
+def register(current_user):
+    data = request.get_json() if request.is_json else request.form
+    
+    required_fields = ['username', 'password']
+    if not all(field in data for field in required_fields):
+        return jsonify({'message': '请提供用户名和密码'}), 400
+    
+    if User.query.filter_by(username=data['username']).first():
+        return jsonify({'message': '用户名已存在'}), 400
+    
+    # 仅管理员可录入APIKey
+    api_key = ""
+    if current_user.is_admin and 'api_key' in data:
+        api_key = data['api_key']
+    
+    new_user = User(
+        username=data['username'],
+        api_key=api_key,
+        is_admin=data.get('is_admin', False)
+    )
+    new_user.set_password(data['password'])
+    
+    if 'research_fields' in data:
+        new_user.set_research_fields(data['research_fields'])
+    
+    db.session.add(new_user)
+    db.session.commit()
+    
+    return jsonify({
+        'message': '用户创建成功（APIKey仅管理员可录入）',
+        'user_id': new_user.id,
+        'is_admin': new_user.is_admin,
+        'has_api_key': bool(new_user.api_key)
+    }), 201
+
+# 登录接口
+@app.route('/api/login', methods=['POST'])
+def login():
+    data = request.get_json() if request.is_json else request.form
+    
+    if not data or not data.get('username') or not data.get('password'):
+        return jsonify({'message': '请提供用户名和密码'}), 400
+    
+    user = User.query.filter_by(username=data['username']).first()
+    
+    if not user or not user.check_password(data['password']):
+        return jsonify({'message': '用户名或密码错误'}), 401
+    
+    token = jwt.encode({
+        'user_id': user.id,
+        'exp': datetime.datetime.utcnow() + datetime.timedelta(hours=24)
+    }, app.config['SECRET_KEY'], algorithm="HS256")
+    
+    return jsonify({
+        'token': token,
+        'user_id': user.id,
+        'username': user.username,
+        'is_admin': user.is_admin
+    }), 200
+
+# 更新用户信息接口
+@app.route('/api/user/profile', methods=['PUT'])
+@token_required
+def update_profile(current_user):
+    data = request.get_json() if request.is_json else request.form
+    
+    # 仅管理员可修改APIKey
+    if 'api_key' in data:
+        target_user_id = request.args.get('user_id', current_user.id)
+        target_user = User.query.get(target_user_id)
+        
+        if not target_user:
+            return jsonify({'message': '目标用户不存在'}), 404
+        
+        if not (current_user.is_admin or current_user.id == target_user.id):
+            return jsonify({'message': '无权限修改该用户信息！'}), 403
+        
+        if current_user.is_admin:
+            target_user.api_key = data['api_key']
+        else:
+            return jsonify({'message': '普通用户无权限修改APIKey！'}), 403
+    
+    # 更新研究领域
+    if 'research_fields' in data and current_user.id == User.query.get(current_user.id).id:
+        current_user.set_research_fields(data['research_fields'])
+    
+    db.session.commit()
+    
+    return jsonify({
+        'message': '用户信息更新成功',
+        'data': {
+            'username': current_user.username,
+            'research_fields': current_user.get_research_fields(),
+            'has_api_key': bool(current_user.api_key)
+        }
+    }), 200
+
+# 获取用户信息接口
+@app.route('/api/user/profile', methods=['GET'])
+@token_required
+def get_profile(current_user):
+    return jsonify({
+        'data': {
+            'username': current_user.username,
+            'research_fields': current_user.get_research_fields(),
+            'has_api_key': bool(current_user.api_key),
+            'is_admin': current_user.is_admin,
+            'created_at': current_user.created_at.isoformat()
+        }
+    }), 200
+
+# 管理员批量设置APIKey接口
+@app.route('/api/admin/batch-set-apikey', methods=['POST'])
+@admin_required
+def batch_set_apikey(current_user):
+    data = request.get_json() if request.is_json else request.form
+    
+    if not data or not 'users' in data or not isinstance(data['users'], list):
+        return jsonify({'message': '请传入批量数据，格式：{"users": [{"user_id":1, "api_key":"xxx"}, ...]}'}), 400
+    
+    success_count = 0
+    fail_list = []
+    
+    for user_item in data['users']:
+        user_id = user_item.get('user_id')
+        api_key = user_item.get('api_key')
+        
+        if not user_id or not api_key:
+            fail_list.append(f"用户ID:{user_id}（缺少user_id或api_key）")
+            continue
+        
+        target_user = User.query.get(user_id)
+        if not target_user:
+            fail_list.append(f"用户ID:{user_id}（用户不存在）")
+            continue
+        
+        target_user.api_key = api_key
+        success_count += 1
+    
+    db.session.commit()
+    
+    return jsonify({
+        'message': f"批量操作完成",
+        'data': {
+            'success_count': success_count,
+            'fail_count': len(fail_list),
+            'fail_details': fail_list
+        }
+    }), 200
+
+# 调用外部学术API
+def call_academic_api(api_key: str, keyword: str) -> List[Dict]:
+    if not api_key or len(api_key.strip()) == 0:
+        raise Exception("用户APIKey为空，请联系管理员录入！")
+    
+    # 模拟API返回
+    return [
+        {
+            "id": f"ext_{keyword}_1",
+            "title": f"Research on {keyword} Applications",
+            "author": "John Doe, Jane Smith",
+            "abstract": f"This paper explores various applications of {keyword} in modern research...",
+            "source": "Academic Journal of Technology"
+        },
+        {
+            "id": f"ext_{keyword}_2",
+            "title": f"Advances in {keyword} Research",
+            "author": "Alice Johnson, Bob Williams",
+            "abstract": f"Recent advances in {keyword} have led to significant breakthroughs...",
+            "source": "Science and Innovation Review"
+        }
+    ]
+
+# 获取论文列表接口
+@app.route('/api/papers', methods=['GET'])
+@token_required
+def get_papers(current_user):
+    keyword = request.args.get('keyword')
+    
+    if not keyword:
+        return jsonify({'message': '请提供关键词（keyword参数）'}), 400
+    
+    if not current_user.api_key:
+        return jsonify({'message': '您的账号未录入APIKey，请联系管理员！'}), 400
+    
+    try:
+        papers_data = call_academic_api(current_user.api_key, keyword)
+        
+        for paper in papers_data:
+            existing_paper = Paper.query.filter_by(external_id=paper['id']).first()
+            if not existing_paper:
+                new_paper = Paper(
+                    title=paper['title'],
+                    author=paper['author'],
+                    abstract=paper['abstract'],
+                    keyword=keyword,
+                    source=paper['source'],
+                    external_id=paper['id']
+                )
+                db.session.add(new_paper)
+        
+        db.session.commit()
+        
+        return jsonify({
+            'message': f"成功获取 {len(papers_data)} 篇关于 {keyword} 的论文",
+            'papers': papers_data
+        }), 200
+        
+    except Exception as e:
+        return jsonify({'message': f"获取论文失败: {str(e)}"}), 500
+
+# 添加论文总结接口（修正了URL路由格式）
+@app.route('/api/papers/<int:paper_id>/summary', methods=['POST'])  # 此处修正了<<为<
+@token_required
+def add_paper_summary(current_user, paper_id):
+    data = request.get_json() if request.is_json else request.form
+    
+    if not data or not data.get('summary_content'):
+        return jsonify({'message': '请提供总结内容'}), 400
+    
+    paper = Paper.query.get(paper_id)
+    if not paper:
+        return jsonify({'message': '论文不存在'}), 404
+    
+    new_summary = PaperSummary(
+        user_id=current_user.id,
+        paper_id=paper_id,
+        summary_content=data['summary_content']
+    )
+    
+    db.session.add(new_summary)
+    db.session.commit()
+    
+    return jsonify({
+        'message': '论文总结添加成功',
+        'summary_id': new_summary.id,
+        'created_at': new_summary.created_at.isoformat()
+    }), 201
+
+# 获取用户的论文总结历史
+@app.route('/api/user/summaries', methods=['GET'])
+@token_required
+def get_user_summaries(current_user):
+    summaries = PaperSummary.query.filter_by(
+        user_id=current_user.id
+    ).order_by(
+        PaperSummary.created_at.desc()
+    ).all()
+    
+    result = []
+    for summary in summaries:
+        paper = Paper.query.get(summary.paper_id)
+        result.append({
+            'summary_id': summary.id,
+            'paper_id': summary.paper_id,
+            'paper_title': paper.title if paper else '未知论文',
+            'summary_content': summary.summary_content,
+            'created_at': summary.created_at.isoformat()
+        })
+    
+    return jsonify({
+        'count': len(result),
+        'summaries': result
+    }), 200
+
+# 初始化数据库并启动应用
+if __name__ == '__main__':
+    with app.app_context():
+        db.create_all()
+    app.run(debug=True, host='0.0.0.0', port=5000)
