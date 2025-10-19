@@ -1,15 +1,20 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 
 # 初始化 FastAPI 应用
 app = FastAPI()
 
+#定义登陆请求体模型
+class LoginRequest(BaseModel):
+    username:str
+    password:str
+    
 # 配置允许跨域访问的前端域名
-# React 开发环境通常运行在 http://localhost:5000
 origins = [
-    "http://localhost:5000",  # 必须包含协议（http/https）和端口
-    # 生产环境添加实际域名，例如："https://your-react-app.com"
-]
+    "http://localhost:5000",
+    "http://localhost:5173",
+    "http://localhost:3000",
 
 # 添加 CORS 中间件
 app.add_middleware(
@@ -24,10 +29,11 @@ app.add_middleware(
 @app.get("/api/hello")
 async def hello():
     return {"message": "Hello from FastAPI (允许跨域访问)"}
-
+#登录接口
 @app.post("/api/login")
-async def login(username: str, password: str):
-    # 实际项目中这里会验证用户名密码
-    if username == "test" and password == "123":
+async def login(login_data:LoginRequest ):
+    # 验证用户名密码
+    if login_data.username == "test" and login_data.password == "123":
         return {"code": 200, "token": "react-fastapi-token", "message": "登录成功"}
     return {"code": 400, "message": "账号或密码错误"}
+
