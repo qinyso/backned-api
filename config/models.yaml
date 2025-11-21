@@ -1,0 +1,9 @@
+# 肾病AI模型配置
+model_paths:
+  pathology_report: "models/pathology_report_model.pth"  # 病理报告生成模型
+  glomeruli_count: "models/glomeruli_count_model.pth"    # 肾小球计数模型
+  nuclei_count: "models/nuclei_count_model.pth"          # 细胞核计数模型
+model_params:
+  batch_size: 8
+  device: "cpu"  # Windows桌面版默认使用CPU，可改为cuda（如有GPU）
+  confidence_threshold: 0.85
